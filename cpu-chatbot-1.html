@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CPU AI Chat</title>
+<style>
+:root{--bg:#f3f6f4;--surface:#fff;--ink:#1b2622;--muted:#66756e;--me:#1f5f4a;--bot:#e4ece8;--line:#d3ddd8}
+@media (prefers-color-scheme:dark){:root{--bg:#121917;--surface:#1a2420;--ink:#e6efeb;--muted:#8fa299;--me:#2f8a6b;--bot:#25312c;--line:#31403a}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--ink);font:16px/1.5 Georgia,serif;display:flex;flex-direction:column;max-width:720px;margin:0 auto}
+header{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+header b{font-size:1.1rem}
+select,button,textarea{font:inherit;color:var(--ink)}
+select{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:6px 8px;max-width:100%}
+#status{padding:10px 16px;color:var(--muted);font-size:.9rem;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+#prog{height:4px;background:var(--line);display:none}
+#prog i{display:block;height:100%;width:0;background:var(--me)}
+#log{flex:1;overflow-y:auto;padding:16px 14px;display:flex;flex-direction:column;gap:10px}
+.m{max-width:85%;padding:10px 14px;border-radius:16px;white-space:pre-wrap;overflow-wrap:anywhere}
+.me{align-self:flex-end;background:var(--me);color:#fff;border-bottom-right-radius:4px}
+.bot{align-self:flex-start;background:var(--bot);border-bottom-left-radius:4px}
+#bar{display:flex;gap:8px;padding:10px 12px calc(10px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--line);background:var(--surface)}
+textarea{flex:1;resize:none;border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:var(--bg);max-height:120px}
+button{border:0;border-radius:12px;padding:0 18px;background:var(--me);color:#fff;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+:focus-visible{outline:2px solid var(--me);outline-offset:2px}
+</style>
+</head>
+<body>
+<header>
+<b>CPU AI Chat v4</b>
+<select id="model" aria-label="Model">
+<option value="HuggingFaceTB/SmolLM2-135M-Instruct" selected>Tiny and fastest (about 200 MB)</option>
+<option value="HuggingFaceTB/SmolLM2-360M-Instruct">Small, better answers (about 390 MB)</option>
+</select>
+<label style="font-size:.9rem;display:flex;gap:6px;align-items:center"><input type="checkbox" id="net" checked> Use internet</label>
+<button id="load" style="padding:8px 14px">Load model</button>
+</header>
+<div id="prog"><i></i></div>
+<div id="status">Choose a model and tap Load model. The first load downloads it to your phone. This version needs no GPU.</div>
+<div id="log"></div>
+<div id="bar">
+<textarea id="in" rows="1" placeholder="Load the model first" aria-label="Message" disabled></textarea>
+<button id="send" disabled>Send</button>
+</div>
+<script>
+const CDN="https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2/+esm";
+function makeEngine(post,pipeline,TextStreamer){
+  let gen=null;
+  return async m=>{
+    if(m.type==='load'){
+      const files={};
+      try{
+        gen=await pipeline('text-generation',m.model,{dtype:'q4',device:'wasm',progress_callback:p=>{
+          if(p.status==='progress'&&p.total){
+            files[p.file]=[p.loaded,p.total];
+            let l=0,t=0;for(const k in files){l+=files[k][0];t+=files[k][1]}
+            post({type:'progress',pct:Math.round(l/t*100)});
+          }
+        }});
+        post({type:'ready'});
+      }catch(err){post({type:'error',message:String(err&&err.message||err)})}
+    }else if(m.type==='chat'){
+      try{
+        let full='';
+        const streamer=new TextStreamer(gen.tokenizer,{skip_prompt:true,skip_special_tokens:true,callback_function:s=>{full+=s;post({type:'token',text:full})}});
+        const r=await gen(m.messages,{max_new_tokens:120,do_sample:false,repetition_penalty:1.1,streamer});
+        post({type:'done',text:(r[0].generated_text.at(-1).content||full).trim()});
+      }catch(err){post({type:'fail'})}
+    }
+  };
+}
+const workerSrc='import { pipeline, TextStreamer } from "'+CDN+'";\nconst h=('+makeEngine.toString()+')(postMessage,pipeline,TextStreamer);\nself.onmessage=e=>h(e.data);';
+
+const $=id=>document.getElementById(id);
+const log=$('log'),input=$('in'),send=$('send'),load=$('load'),status=$('status'),prog=$('prog'),bar=prog.firstElementChild;
+let ready=false,busy=false,out=null,bridge=null,pending=null,mode='';
+const history=[{role:'system',content:'You are a friendly, helpful assistant. Keep answers short and clear.'}];
+function add(cls,t){const d=document.createElement('div');d.className='m '+cls;d.textContent=t;log.appendChild(d);log.scrollTop=log.scrollHeight;return d}
+function handle(m){
+  if(m.type==='progress'){bar.style.width=m.pct+'%';status.textContent='Downloading model… '+m.pct+'%'}
+  else if(m.type==='ready'){ready=true;status.textContent='Model ready ('+mode+'). It runs on this device and can work offline.';prog.style.display='none';input.disabled=false;send.disabled=false;input.placeholder='Write a message';input.focus()}
+  else if(m.type==='error'){status.textContent='Could not load the model: '+m.message+'. Check your connection and try again.';load.disabled=false;$('model').disabled=false;prog.style.display='none'}
+  else if(m.type==='token'){out.textContent=m.text;log.scrollTop=log.scrollHeight}
+  else if(m.type==='done'){out.textContent=m.text+(srcNote?'\n\nSources: '+srcNote:'');history.push({role:'assistant',content:m.text});finish()}
+  else if(m.type==='fail'){out.textContent='That message failed. Send it again.';history.pop();finish()}
+}
+async function useMain(){
+  mode='basic mode, the page may pause while replying';
+  status.textContent='Background mode is unavailable here. Loading in basic mode…';
+  try{
+    const mod=await import(CDN);
+    const h=makeEngine(handle,mod.pipeline,mod.TextStreamer);
+    bridge={post:m=>setTimeout(()=>h(m),60)};
+    if(pending)bridge.post(pending);
+  }catch(e){handle({type:'error',message:'could not reach the model library ('+(e&&e.message?e.message:e)+')'})}
+}
+function useWorker(){
+  try{
+    const w=new Worker(URL.createObjectURL(new Blob([workerSrc],{type:'text/javascript'})),{type:'module'});
+    mode='background mode';
+    w.onmessage=e=>handle(e.data);
+    w.onerror=()=>{if(!ready&&bridge&&bridge.isWorker){bridge=null;useMain()}};
+    bridge={isWorker:true,post:m=>w.postMessage(m)};
+  }catch(e){useMain()}
+}
+useWorker();
+function finish(){busy=false;send.disabled=false;input.disabled=false;input.focus()}
+load.onclick=()=>{
+  load.disabled=true;$('model').disabled=true;prog.style.display='block';
+  status.textContent='Starting download…';
+  pending={type:'load',model:$('model').value};
+  if(bridge)bridge.post(pending);
+};
+let srcNote='';
+let lastErr='';
+async function getJSON(u){
+  const ctl=new AbortController();const to=setTimeout(()=>ctl.abort(),6000);
+  try{const r=await fetch(u,{signal:ctl.signal});if(!r.ok)throw new Error('HTTP '+r.status);return await r.json()}finally{clearTimeout(to)}
+}
+async function wiki(host,q,n){
+  const j=await getJSON('https://'+host+'/w/api.php?action=query&generator=search&gsrsearch='+encodeURIComponent(q.slice(0,200))+'&gsrlimit='+n+'&prop=extracts&exintro=1&explaintext=1&exsentences=6&format=json&origin=*');
+  return Object.values((j.query&&j.query.pages)||{}).sort((a,b)=>a.index-b.index).filter(p=>p.extract);
+}
+async function weather(q){
+  const m=q.match(/\b(?:in|at|for)\s+([a-z][a-z .'-]{1,40})/i);
+  if(!m)return null;
+  const place=m[1].replace(/\b(today|now|tomorrow|right now|currently)\b.*$/i,'').trim();
+  const g=await getJSON('https://geocoding-api.open-meteo.com/v1/search?count=1&name='+encodeURIComponent(place));
+  const c=g.results&&g.results[0];if(!c)return null;
+  const w=await getJSON('https://api.open-meteo.com/v1/forecast?latitude='+c.latitude+'&longitude='+c.longitude+'&current=temperature_2m,relative_humidity_2m,wind_speed_10m,precipitation&timezone=auto');
+  const k=w.current;if(!k)return null;
+  return{title:'Open-Meteo weather for '+c.name+(c.country?', '+c.country:''),extract:'Current weather in '+c.name+': temperature '+k.temperature_2m+' °C, humidity '+k.relative_humidity_2m+'%, wind '+k.wind_speed_10m+' km/h, precipitation '+k.precipitation+' mm (observed '+k.time+').'};
+}
+async function lookup(q){
+  const t=q.trim();
+  if(!$('net').checked)return null;
+  if(t.length<3||/^(hi|hello|hey|thanks|thank you|ok|okay)\b/i.test(t))return null;
+  const parts=[];
+  try{
+    if(/\b(weather|temperature|forecast|rain|raining|humid)/i.test(t)){const w=await weather(t).catch(()=>null);if(w)parts.push(w)}
+    if(/\b(news|latest|today|recent|recently|current|currently|breaking|this week|this year|happened)\b/i.test(t)){const n=await wiki('en.wikinews.org',t,2).catch(()=>[]);parts.push(...n)}
+    let w=await wiki('en.wikipedia.org',t,2).catch(e=>{lastErr=String(e&&e.message||e);return[]});
+    if(!w.length){
+      const o=await getJSON('https://en.wikipedia.org/w/api.php?action=opensearch&limit=1&format=json&origin=*&search='+encodeURIComponent(t.replace(/^(about|tell me about|what is|who is)\s+/i,'').slice(0,100))).catch(e=>{lastErr=String(e&&e.message||e);return null});
+      const title=o&&o[1]&&o[1][0];
+      if(title){const sm=await getJSON('https://en.wikipedia.org/api/rest_v1/page/summary/'+encodeURIComponent(title)).catch(e=>{lastErr=String(e&&e.message||e);return null});if(sm&&sm.extract)w=[{title:sm.title,extract:sm.extract}]}
+    }
+    parts.push(...w);
+  }catch(e){lastErr=String(e&&e.message||e)}
+  if(!parts.length)return null;
+  return{text:parts.map(p=>p.title+': '+p.extract).join('\n\n').slice(0,1500),titles:parts.map(p=>p.title).join(', ')};
+}
+async function go(){
+  lastErr='';
+  const t=input.value.trim();
+  if(!t||busy||!ready)return;
+  input.value='';busy=true;send.disabled=true;
+  history.push({role:'user',content:t});add('me',t);
+  out=add('bot',$('net').checked?'Searching the internet…':'Thinking…');
+  const f=await lookup(t);
+  srcNote=f?f.titles:'';
+  out.textContent=f?'Thinking…':($('net').checked?'Internet lookup failed'+(lastErr?' ('+lastErr+')':' (nothing found)')+'. Answering from the model only…':'Thinking…');
+  const today=new Date().toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'});
+  const sys={role:'system',content:'You are a friendly, helpful assistant. Today is '+today+'. Keep answers short and clear. When facts are provided, answer using them. If they do not answer the question, say you are not sure.'};
+  const recent=history.slice(1).slice(-6);
+  if(f){const last=recent[recent.length-1];recent[recent.length-1]={role:'user',content:'Facts:\n'+f.text+'\n\nQuestion: '+last.content}}
+  bridge.post({type:'chat',messages:[sys,...recent]});
+}
+send.onclick=go;
+input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();go()}});
+</script>
+</body>
+</html>
